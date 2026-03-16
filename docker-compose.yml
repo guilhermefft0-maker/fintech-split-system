@@ -1,0 +1,151 @@
+
+# ─── Shared environment injected into both app services ───────────────────────
+x-app-env: &app-env
+  NODE_ENV: development
+  LOG_LEVEL: info
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_NAME: fintech_split
+  DB_USER: postgres
+  DB_PASSWORD: postgres
+  DB_POOL_MAX: 20
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_ENDPOINT: http://localstack:4566
+  SQS_QUEUE_URL: http://localstack:4566/000000000000/fintech-payments.fifo
+  SQS_DLQ_QUEUE_URL: http://localstack:4566/000000000000/fintech-payments-dlq.fifo
+  MAX_SQS_RECEIVE_COUNT: 5
+  # Signature mode: use "hmac" locally; "ecdsa" in production
+  SIGNATURE_MODE: hmac
+  WEBHOOK_HMAC_SECRET: local-dev-secret
+  # Stark Bank sandbox credentials (replace with real values)
+  STARK_ENV: sandbox
+  STARK_PROJECT_ID: ${STARK_PROJECT_ID:-dummy-project-id}
+  STARK_PRIVATE_KEY: ${STARK_PRIVATE_KEY:-dummy-key}
+  # Split accounts (replace with real values for sandbox testing)
+  LICENSED_NAME: Licenciado Teste
+  LICENSED_TAX_ID: "000.000.000-00"
+  LICENSED_BANK_CODE: "001"
+  LICENSED_BRANCH_CODE: "0001"
+  LICENSED_ACCOUNT_NUMBER: "000000-0"
+  LICENSED_ACCOUNT_TYPE: checking
+  HOLDING_NAME: Holding Teste
+  HOLDING_TAX_ID: "00.000.000/0001-00"
+  HOLDING_BANK_CODE: "001"
+  HOLDING_BRANCH_CODE: "0001"
+  HOLDING_ACCOUNT_NUMBER: "000000-1"
+  HOLDING_ACCOUNT_TYPE: checking
+
+services:
+
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: fintech_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: fintech_split
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-run initial migration on first boot
+      - ./database/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d fintech_split"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── LocalStack (AWS SQS emulator) ────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3.3
+    container_name: fintech_localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+      DEFAULT_REGION: us-east-1
+      EAGER_SERVICE_LOADING: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/init-sqs.sh:ro
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"running\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Database migrations ──────────────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: services/webhook/Dockerfile
+      target: builder
+    container_name: fintech_migrate
+    command: ["npx", "ts-node", "src/database/migrate.ts"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Webhook service ──────────────────────────────────────────────────────────
+  webhook:
+    build:
+      context: .
+      dockerfile: services/webhook/Dockerfile
+    container_name: fintech_webhook
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: webhook-service
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Payment worker ───────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    container_name: fintech_worker
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      SERVICE_NAME: payment-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Scale workers horizontally: docker compose up --scale worker=3
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+volumes:
+  postgres_data:
+  localstack_data:
