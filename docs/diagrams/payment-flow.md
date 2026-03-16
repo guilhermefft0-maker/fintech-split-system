@@ -1,110 +1,111 @@
-# Payment Flow — Step by Step
+# Fluxo de Pagamento — Passo a Passo
 
-## Happy Path
+## Fluxo feliz (caminho normal)
 
 ```
-Stark Bank                Webhook Service              SQS                   Worker                  PostgreSQL            Stark API
+Stark Bank              Webhook Service              SQS                   Worker                  PostgreSQL            Stark API
     │                           │                       │                      │                          │                     │
     │  POST /webhook/stark       │                       │                      │                          │                     │
     │  Digital-Signature: <sig>  │                       │                      │                          │                     │
     │ ─────────────────────────► │                       │                      │                          │                     │
-    │                           │ validate ECDSA sig    │                      │                          │                     │
-    │                           │ parse JSON payload    │                      │                          │                     │
-    │                           │ filter "paid" events  │                      │                          │                     │
+    │                           │ valida assinatura ECDSA│                      │                          │                     │
+    │                           │ faz parse do payload  │                      │                          │                     │
+    │                           │ filtra eventos "paid" │                      │                          │                     │
     │                           │                       │                      │                          │                     │
-    │                           │ SendMessage(eventId)  │                      │                          │                     │
+    │                           │ enfileira (eventId)   │                      │                          │                     │
     │                           │ ─────────────────────►│                      │                          │                     │
     │                           │   MessageId           │                      │                          │                     │
     │                           │ ◄─────────────────────│                      │                          │                     │
     │  HTTP 200                  │                       │                      │                          │                     │
     │ ◄───────────────────────── │                       │                      │                          │                     │
     │                           │                       │                      │                          │                     │
-    │                           │                       │  ReceiveMessage      │                          │                     │
+    │                           │                       │  recebe mensagem     │                          │                     │
     │                           │                       │ ◄────────────────────│                          │                     │
-    │                           │                       │  [payment message]   │                          │                     │
+    │                           │                       │  [dados do pagamento]│                          │                     │
     │                           │                       │ ─────────────────────►                          │                     │
     │                           │                       │                      │                          │                     │
-    │                           │                       │                      │  BEGIN                   │                     │
+    │                           │                       │                      │  INÍCIO DA TRANSAÇÃO     │                     │
     │                           │                       │                      │ ─────────────────────────►                     │
     │                           │                       │                      │                          │                     │
     │                           │                       │                      │  SELECT FOR UPDATE        │                     │
-    │                           │                       │                      │  (idempotency check)      │                     │
+    │                           │                       │                      │  (verificação de          │                     │
+    │                           │                       │                      │   idempotência)           │                     │
     │                           │                       │                      │ ─────────────────────────►                     │
-    │                           │                       │                      │  → not found             │                     │
+    │                           │                       │                      │  → não encontrado        │                     │
     │                           │                       │                      │  INSERT PROCESSING        │                     │
     │                           │                       │                      │ ─────────────────────────►                     │
     │                           │                       │                      │                          │                     │
     │                           │                       │                      │  INSERT ledger PENDING    │                     │
-    │                           │                       │                      │  (LICENSED + HOLDING)     │                     │
+    │                           │                       │                      │  (LICENCIADO + HOLDING)   │                     │
     │                           │                       │                      │ ─────────────────────────►                     │
     │                           │                       │                      │                          │                     │
-    │                           │                       │                      │  Transfer 98%            │                     │
-    │                           │                       │                      │ ────────────────────────────────────────────── ►
-    │                           │                       │                      │  transferId-licensed     │                     │
-    │                           │                       │                      │ ◄──────────────────────────────────────────────
+    │                           │                       │                      │  Transferência 98%       │                     │
+    │                           │                       │                      │ ──────────────────────────────────────────────►│
+    │                           │                       │                      │  transferId-licenciado   │                     │
+    │                           │                       │                      │ ◄──────────────────────────────────────────────│
     │                           │                       │                      │                          │                     │
-    │                           │                       │                      │  Transfer 2%             │                     │
-    │                           │                       │                      │ ────────────────────────────────────────────── ►
+    │                           │                       │                      │  Transferência 2%        │                     │
+    │                           │                       │                      │ ──────────────────────────────────────────────►│
     │                           │                       │                      │  transferId-holding      │                     │
-    │                           │                       │                      │ ◄──────────────────────────────────────────────
+    │                           │                       │                      │ ◄──────────────────────────────────────────────│
     │                           │                       │                      │                          │                     │
     │                           │                       │                      │  UPDATE ledger → SENT     │                     │
-    │                           │                       │                      │  UPDATE payment→COMPLETED │                     │
+    │                           │                       │                      │  UPDATE pagamento→COMPLETED│                   │
     │                           │                       │                      │ ─────────────────────────►                     │
     │                           │                       │                      │                          │                     │
     │                           │                       │                      │  COMMIT                  │                     │
     │                           │                       │                      │ ─────────────────────────►                     │
     │                           │                       │                      │                          │                     │
-    │                           │                       │  DeleteMessage       │                          │                     │
+    │                           │                       │  remove mensagem     │                          │                     │
     │                           │                       │ ◄────────────────────│                          │                     │
 ```
 
 ---
 
-## Duplicate Webhook (Idempotency)
+## Webhook duplicado (Idempotência)
 
 ```
-Stark Bank sends same event twice:
+Stark Bank envia o mesmo evento duas vezes:
 
-  1st delivery → Worker inserts PROCESSING, executes split → COMPLETED ✅
-  2nd delivery → Worker finds COMPLETED → returns early, no transfers ✅
-```
-
----
-
-## Stark API Failure with Retry
-
-```
-  Attempt 1 → Stark API timeout → delay 5s
-  Attempt 2 → Stark API 503     → delay 25s
-  Attempt 3 → Stark API OK      → transfers created → COMPLETED ✅
-```
-
-If all attempts fail:
-```
-  payment.status → FAILED
-  SQS message stays visible (VisibilityTimeout expires)
-  Worker picks it up again (up to MAX_SQS_RECEIVE_COUNT)
-  After N failures → Dead Letter Queue
+  1ª entrega → Worker insere PROCESSING, executa split → COMPLETED ✅
+  2ª entrega → Worker encontra COMPLETED → retorna sem fazer nada ✅
 ```
 
 ---
 
-## Concurrent Workers (Race Condition Prevention)
+## Falha na API da Stark Bank com Retry
+
+```
+  Tentativa 1 → timeout na Stark API → aguarda 5s
+  Tentativa 2 → Stark API 503        → aguarda 25s
+  Tentativa 3 → Stark API OK         → transferências criadas → COMPLETED ✅
+```
+
+Se todas as tentativas falharem:
+```
+  pagamento.status → FAILED
+  mensagem permanece visível no SQS (VisibilityTimeout expira)
+  Worker reprocessa (até MAX_SQS_RECEIVE_COUNT tentativas)
+  Após N falhas → Dead Letter Queue (fila de mensagens mortas)
+```
+
+---
+
+## Workers concorrentes (prevenção de condição de corrida)
 
 ```
 Worker A                       Worker B                    PostgreSQL
    │                               │                           │
-   │  BEGIN                        │  BEGIN                    │
+   │  INÍCIO DA TRANSAÇÃO          │  INÍCIO DA TRANSAÇÃO      │
    │  SELECT FOR UPDATE SKIP LOCKED│                           │
    │ ────────────────────────────────────────────────────────► │
-   │  → row acquired (PROCESSING)  │                           │
+   │  → registro adquirido (PROCESSING)                        │
    │ ◄──────────────────────────── │                           │
    │                               │  SELECT FOR UPDATE SKIP LOCKED
    │                               │ ─────────────────────────►│
-   │                               │  → row SKIPPED (locked)   │
+   │                               │  → registro IGNORADO (bloqueado)
    │                               │ ◄─────────────────────────│
-   │                               │  → returns early ✅        │
-   │  [executes split...]          │                           │
+   │                               │  → retorna sem processar ✅│
+   │  [executa o split...]         │                           │
    │  COMMIT                       │                           │
 ```
